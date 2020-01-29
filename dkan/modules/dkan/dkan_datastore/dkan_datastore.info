@@ -1,0 +1,15 @@
+name = DKAN Datastore
+description = Creates a datastore designed to make it easy to share open data.
+core = 7.x
+package = DKAN
+dependencies[] = entity
+dependencies[] = field_hidden
+dependencies[] = uuid
+dependencies[] = views
+dependencies[] = xautoload
+features[ctools][] = views:views_default:3.0
+features[features_api][] = api:2
+features[field_base][] = field_datastore_status
+features[field_instance][] = node-resource-field_datastore_status
+features[views_view][] = datasets
+version = 7.x-1.18

@@ -1,0 +1,12 @@
+name = "Date module tests"
+description = "Support module for date related testing."
+package = Date/Time
+version = VERSION
+core = 7.x
+hidden = TRUE
+dependencies[] = date
+
+; Information added by drush on 2018-01-16
+version = "7.x-2.x-dev"
+project = "date"
+datestamp = "1516128997"

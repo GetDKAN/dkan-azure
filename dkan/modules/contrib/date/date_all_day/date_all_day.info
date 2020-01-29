@@ -1,0 +1,11 @@
+name = Date All Day
+description = Adds 'All Day' functionality to date fields, including an 'All Day' theme and 'All Day' checkboxes for the Date select and Date popup widgets.
+dependencies[] = date_api
+dependencies[] = date
+package = Date/Time
+core = 7.x
+
+; Information added by drush on 2018-01-16
+version = "7.x-2.x-dev"
+project = "date"
+datestamp = "1516128997"

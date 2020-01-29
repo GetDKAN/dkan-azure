@@ -1,0 +1,746 @@
+<?php
+
+/**
+ * @file
+ * Creates DKAN Datastore.
+ */
+
+include_once "dkan_datastore.features.inc";
+
+use Dkan\Datastore\Manager\ManagerInterface;
+use Dkan\Datastore\Manager\Factory;
+use Dkan\Datastore\Resource;
+use Dkan\Datastore\LockableDrupalVariables;
+
+/**
+ * Implements hook_xautoload().
+ */
+function dkan_datastore_xautoload($adapter) {
+  $adapter->absolute()->addPsr4(
+    'Dkan\Datastore\\',
+    drupal_get_path("module", "dkan_datastore") . '/src'
+  );
+}
+
+/**
+ * Implements hook_services_resources().
+ */
+function dkan_datastore_services_resources() {
+  module_load_include('inc', 'dkan_datastore', 'resources/dkan_datastore_resource');
+  $resources = array();
+  $resources += _dkan_datastore_resource_definition();
+  return $resources;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function dkan_datastore_menu() {
+
+  // @todo Move somewhere else.
+  $items['node/%dkan_datastore_resource/download'] = array(
+    'title callback' => 'dkan_datastore_download_title',
+    'title arguments' => array(1),
+    'page callback' => 'dkan_datastore_download',
+    'page arguments' => array(1),
+    'access callback' => 'dkan_datastore_access',
+    'access arguments' => array('view', 1),
+    'file' => 'dkan_datastore.pages.inc',
+    'weight' => '20',
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  // @todo Move somewhere else.
+  $items['node/%dkan_datastore_resource/data'] = array(
+    'page callback' => 'dkan_datastore_proxy',
+    'page arguments' => array(1),
+    'access callback' => 'dkan_datastore_access',
+    'access arguments' => array('view', 1),
+    'file' => 'dkan_datastore.pages.inc',
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['node/%node/datastore'] = array(
+    'title' => 'Manage Datastore',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('dkan_datastore_pages', 1),
+    'access callback' => 'dkan_datastore_access',
+    'access arguments' => array('manage', 1),
+    'file' => 'dkan_datastore.pages.inc',
+    'weight' => '15',
+    'type' => MENU_LOCAL_TASK,
+  );
+  return $items;
+}
+
+/**
+ * Get managers info.
+ */
+function dkan_datastore_managers_info() {
+  return module_invoke_all("dkan_datastore_manager");
+}
+
+/**
+ * Retrieves the url and type to the physical resource.
+ */
+function dkan_datastore_resource_link_type($node) {
+  $node_wrapper = entity_metadata_wrapper('node', $node);
+  $file_field = dkan_datastore_file_upload_field();
+  $remote_file_field = dkan_datastore_file_link_field();
+  $api_field = dkan_datastore_api_link_field();
+  $type = 'resource';
+
+  if ($node->type == $type && $file = $node_wrapper->{$file_field}->value()) {
+    $uri = isset($file->uri) ? $file->uri : $file['uri'];
+    $url = file_create_url($uri);
+    return array('url' => $url, 'type' => 'upload');
+  }
+  elseif ($remote_file = $node_wrapper->{$remote_file_field}->value()) {
+    return array('url' => $remote_file['uri'], 'type' => 'remote');
+  }
+  elseif ($link = $node_wrapper->{$api_field}->value()) {
+    return array('url' => $link['url'], 'type' => 'link');
+  }
+  else {
+    drupal_set_message(t('No download available for this resource'));
+    return array('type' => 'upload');
+  }
+}
+
+/**
+ * Retrive download title for a resource.
+ *
+ * Title callback to change the download link text
+ * based on the type of the resource link.
+ */
+function dkan_datastore_download_title($node) {
+  $resource_link_type = dkan_datastore_resource_link_type($node);
+  return ($resource_link_type['type'] == 'link') ? t('Go to resource') : t('Download');
+}
+
+/**
+ * Implements hook_menu_alter().
+ */
+function dkan_datastore_menu_alter(&$items) {
+  // Removing these here, readding in hook_menu().
+  unset($items['node/%node/delete-items']);
+  unset($items['node/%node/import']);
+  unset($items['node/%node/unlock']);
+}
+
+/**
+ * Access callback for DKAN Datastore operations.
+ */
+function dkan_datastore_access($op, $node, $account = NULL) {
+  try {
+    Resource::createFromDrupalNode($node);
+  }
+  catch (\Exception $e) {
+    return FALSE;
+  }
+
+  global $user;
+  if (!isset($account)) {
+    $account = $user;
+  }
+
+  switch ($op) {
+    case 'view':
+      return node_access('view', $node, $account);
+
+    case 'drop':
+    case 'delete':
+    case 'import':
+    case 'manage':
+      // All available operations require the 'manage datastore' permission.
+      if (user_access('manage datastore', $account) && node_access('update', $node, $account)) {
+        return TRUE;
+      }
+      break;
+  }
+}
+
+/**
+ * Load node by id or uuid.
+ */
+function dkan_datastore_resource_load($id) {
+  try {
+    // Id is a nid.
+    if (is_numeric($id)) {
+      return node_load($id);
+    }
+    // Id is a uuid and uuid is installed.
+    elseif (function_exists('entity_uuid_load')) {
+      $node = entity_uuid_load('node', array($id));
+      return ($node) ? reset($node) : FALSE;
+    }
+  }
+  catch (Exception $e) {
+    return FALSE;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Access callback for 'Add Resource' tab.
+ */
+function dkan_add_resource($node) {
+  if ($node->type != 'dataset') {
+    return FALSE;
+  }
+  else {
+    return _node_add_access();
+  }
+}
+
+/**
+ * Implements hook_node_update().
+ */
+function dkan_datastore_node_insert($node) {
+  $type = dkan_datastore_node_type();
+  if ($node->type == $type) {
+    try {
+      $resource = Resource::createFromDrupalNode($node);
+      $manager = (new Factory($resource))->get();
+      $manager->saveState();
+    }
+    catch (\Exception $e) {
+      drupal_set_message($e->getMessage());
+    }
+  }
+}
+
+/**
+ * Implements hook_node_update().
+ */
+function dkan_datastore_node_update($node) {
+  $type = dkan_datastore_node_type();
+  if ($node->type == $type) {
+    $file_field = dkan_datastore_file_upload_field();
+    $link_field = dkan_datastore_file_link_field();
+    // See if we have a file link or upload.
+    $wrapper = entity_metadata_wrapper('node', $node);
+    $file = $wrapper->{$file_field}->value();
+    if (!$file) {
+      $link = $wrapper->{$link_field}->value();
+      if (isset($link) && isset($link['fid'])) {
+        $file = file_load($link['fid']);
+      }
+      elseif (isset($link) && isset($link->fid)) {
+        $file = $link;
+      }
+      else {
+        $file = '';
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_node_delete().
+ */
+function dkan_datastore_node_delete($node) {
+  if ($node->type == "resource") {
+    try {
+      /* @var  $manager ManagerInterface */
+      $manager = (new Factory(Resource::createFromDrupalNode($node)))->get();
+      $manager->drop();
+    }
+    catch (\Exception $e) {
+
+    }
+  }
+}
+
+/**
+ * Implements hook_permission().
+ */
+function dkan_datastore_permission() {
+  return array(
+    'manage datastore' => array(
+      'title' => t('Manage Datastore'),
+    ),
+    'manage datastore settings' => array(
+      'title' => t('Manage Datastore Settings'),
+    ),
+  );
+}
+
+/**
+ * Determines if a resource can be imported.
+ */
+function dkan_datastore_is_importable($file) {
+  return (is_object($file) && $file->filemime == 'text/csv') || (is_array($file) && array_key_exists('filemime', $file) && $file['filemime'] == 'text/csv');
+}
+
+/**
+ * Retrieves loaded file from resource node.
+ */
+function dkan_datastore_file_field($node) {
+  $type = dkan_datastore_node_type();
+  if (isset($node->type) && $node->type == $type) {
+    $file_field = dkan_datastore_file_upload_field();
+    $link_field = dkan_datastore_file_link_field();
+    $wrapper = entity_metadata_wrapper('node', $node);
+    $file = isset($wrapper->{$file_field}) ? $wrapper->{$file_field}->value() : '';
+    $link = isset($wrapper->{$link_field}) ? $wrapper->{$link_field}->value() : '';
+    if (isset($file)) {
+      return $file;
+    }
+    elseif ($link) {
+      return $link;
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Implements hook_field_formatter_info().
+ */
+function dkan_datastore_field_formatter_info() {
+  $formatters = array(
+    'dkan_datastore_status_formatter' => array(
+      'label' => t('Datastore Status'),
+      'field types' => array('recline_field'),
+    ),
+  );
+  return $formatters;
+}
+
+/**
+ * Implements hook_field_formatter_view().
+ */
+function dkan_datastore_field_formatter_view($entity_type, $entity, $field, $instance, $langcode, $items, $display) {
+
+  $element = array();
+
+  foreach ($items as $delta => $item) {
+    $item['entity'] = $entity;
+    $element[$delta] = array(
+      '#theme' => 'dkan_datastore_status_formatter',
+      '#item' => $item,
+    );
+  }
+
+  return $element;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function dkan_datastore_theme() {
+  return array(
+    'dkan_datastore_status_formatter' => array(
+      'variables' => array('item' => NULL),
+    ),
+  );
+}
+
+/**
+ * Returns HTML for an recline field formatter.
+ *
+ * @param array $variables
+ *   An associative array containing:
+ *   - item: Associative array of recline field.
+ *
+ * @ingroup themeable
+ */
+function theme_dkan_datastore_status_formatter(array $variables) {
+  $node = $variables['item']['entity'];
+  try {
+    $resource = \Dkan\Datastore\Resource::createFromDrupalNode($node);
+
+    /* @var $manager ManagerInterface */
+    $manager = (new Factory($resource))->get();
+    $status = $manager->getStatus();
+    $string = \Dkan\Datastore\Page\Component\Status::datastoreStateToString($status['data_import']);
+    return '<span class="circle true">' . t($string) . '</span>';
+  }
+  catch (\Exception $e) {
+    return '<span class="circle true">' . t('Datastore disabled') . '</span>';
+  }
+}
+
+/**
+ * Returns name of upload field.
+ */
+function dkan_datastore_file_upload_field() {
+  static $field;
+  if (!$field) {
+    $field = 'field_upload';
+    drupal_alter('dkan_datastore_file_upload_field', $field);
+  }
+  return $field;
+}
+
+/**
+ * Returns name of link api field.
+ */
+function dkan_datastore_api_link_field() {
+  static $field;
+  if (!$field) {
+    $field = 'field_link_api';
+    drupal_alter('dkan_datastore_field_link_api', $field);
+  }
+  return $field;
+}
+
+/**
+ * Returns name of remote file field.
+ */
+function dkan_datastore_file_link_field() {
+  static $field;
+  if (!$field) {
+    $field = 'field_link_remote_file';
+    drupal_alter('dkan_datastore_field_link_remote_file', $field);
+  }
+  return $field;
+}
+
+/**
+ * Returns name of node type that the Datastore is attached to.
+ *
+ * @deprecated
+ * Use Resource::resourceContentType.
+ */
+function dkan_datastore_node_type() {
+  return 'resource';
+}
+
+/**
+ * Implements hook_node_presave().
+ */
+function dkan_datastore_node_presave($node) {
+  if (is_object($node) && $node->type == 'resource') {
+    /*$wrap = entity_metadata_wrapper('node', $node);
+    $wrap->field_datastore_status->set(dkan_datastore_status($node));*/
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function dkan_datastore_cron() {
+  if (drupal_is_cli()) {
+    $storage = new LockableDrupalVariables("dkan_datastore");
+
+    $bin = $storage->borrowBin();
+
+    $already_importing = FALSE;
+
+    $current_nid = NULL;
+    foreach ($bin as $nid => $state) {
+      if ($state['data_import'] == ManagerInterface::DATA_IMPORT_IN_PROGRESS) {
+        $already_importing = TRUE;
+        break;
+      }
+      elseif ($state['data_import'] == ManagerInterface::DATA_IMPORT_READY || $state['data_import'] == ManagerInterface::DATA_IMPORT_PAUSED) {
+        $current_nid = $nid;
+        break;
+      }
+    }
+
+    $storage->returnBin($bin);
+
+    if ($current_nid) {
+      print_r(PHP_EOL . "DKAN DATASTORE: Starting Import of Resource {$nid}" . PHP_EOL);
+
+      $resource = Resource::createFromDrupalNodeNid($current_nid);
+
+      /* @var $manager ManagerInterface */
+      $manager = (new Factory($resource))->get();
+
+      $finished = $manager->import();
+
+      if ($finished) {
+        print_r(PHP_EOL . "DKAN DATASTORE: Done Importing Resource {$current_nid}" . PHP_EOL);
+      }
+      else {
+        $general = "DKAN DATASTORE: There was a problem while importing Resource {$current_nid}";
+        $errors = $manager->getErrors();
+        $error_string = implode(" | ", $errors);
+        $final_error_string = "{$general} - {$error_string}";
+        print_r(PHP_EOL . $final_error_string . PHP_EOL);
+        watchdog("error", $final_error_string);
+      }
+    }
+    else {
+      if ($already_importing) {
+        print_r(PHP_EOL . "DKAN DATASTORE: Already Importing {$nid}" . PHP_EOL);
+      }
+      else {
+        print_r(PHP_EOL . "DKAN DATASTORE: No Resources to Import" . PHP_EOL);
+      }
+    }
+  }
+}
+
+/**
+ * Determines safe name using reserved words. Should move to data.
+ */
+function dkan_datastore_safe_name($name) {
+  $map = array(
+    '.' => '_',
+    ':' => '',
+    '/' => '',
+    '-' => '_',
+    ' ' => '_',
+    ',' => '_',
+  );
+  $simple = trim(strtolower(strip_tags($name)));
+  // Limit length to 64 http://dev.mysql.com/doc/refman/5.0/en/identifiers.html
+  $simple = substr(strtr($simple, $map), 0, 64);
+
+  if (is_numeric($simple)) {
+    // We need to escape numerics because Drupal's drupal_write_record()
+    // does not properly escape token MYSQL names.
+    $simple = '__num_' . $simple;
+  }
+
+  $reserved = dkan_datastore_reserved_words();
+  if (in_array($simple, $reserved)) {
+    $simple = $simple . '_';
+  }
+
+  return db_escape_table($simple);
+}
+
+/**
+ * Creates list of reserved words for MySQL.
+ */
+function dkan_datastore_reserved_words() {
+  return array(
+    'accessible',
+    'add',
+    'all',
+    'alter',
+    'analyze',
+    'and',
+    'as',
+    'asc',
+    'asensitive',
+    'before',
+    'between',
+    'bigint',
+    'binary',
+    'blob',
+    'both',
+    'by',
+    'call',
+    'cascade',
+    'case',
+    'change',
+    'char',
+    'character',
+    'check',
+    'collate',
+    'column',
+    'condition',
+    'constraint',
+    'continue',
+    'convert',
+    'create',
+    'cross',
+    'current_date',
+    'current_time',
+    'current_timestamp',
+    'current_user',
+    'cursor',
+    'database',
+    'databases',
+    'day_hour',
+    'day_microsecond',
+    'day_minute',
+    'day_second',
+    'dec',
+    'decimal',
+    'declare',
+    'default',
+    'delayed',
+    'delete',
+    'desc',
+    'describe',
+    'deterministic',
+    'distinct',
+    'distinctrow',
+    'div',
+    'double',
+    'drop',
+    'dual',
+    'each',
+    'else',
+    'elseif',
+    'enclosed',
+    'escaped',
+    'exists',
+    'exit',
+    'explain',
+    'false',
+    'fetch',
+    'float',
+    'float4',
+    'float8',
+    'for',
+    'force',
+    'foreign',
+    'from',
+    'fulltext',
+    'get',
+    'grant',
+    'group',
+    'having',
+    'high_priority',
+    'hour_microsecond',
+    'hour_minute',
+    'hour_second',
+    'if',
+    'ignore',
+    'in',
+    'index',
+    'infile',
+    'inner',
+    'inout',
+    'insensitive',
+    'insert',
+    'int',
+    'int1',
+    'int2',
+    'int3',
+    'int4',
+    'int8',
+    'integer',
+    'interval',
+    'into',
+    'io_after_gtids',
+    'io_before_gtids',
+    'is',
+    'iterate',
+    'join',
+    'key',
+    'keys',
+    'kill',
+    'leading',
+    'leave',
+    'left',
+    'like',
+    'limit',
+    'linear',
+    'lines',
+    'load',
+    'localtime',
+    'localtimestamp',
+    'lock',
+    'long',
+    'longblob',
+    'longtext',
+    'loop',
+    'low_priority',
+    'master_bind',
+    'master_ssl_verify_server_cert',
+    'match',
+    'maxvalue',
+    'mediumblob',
+    'mediumint',
+    'mediumtext',
+    'middleint',
+    'minute_microsecond',
+    'minute_second',
+    'mod',
+    'modifies',
+    'natural',
+    'not',
+    'no_write_to_binlog',
+    'null',
+    'numeric',
+    'on',
+    'optimize',
+    'option',
+    'optionally',
+    'or',
+    'order',
+    'out',
+    'outer',
+    'outfile',
+    'partition',
+    'precision',
+    'primary',
+    'procedure',
+    'purge',
+    'range',
+    'read',
+    'reads',
+    'read_write',
+    'real',
+    'references',
+    'regexp',
+    'release',
+    'rename',
+    'repeat',
+    'replace',
+    'require',
+    'resignal',
+    'restrict',
+    'return',
+    'revoke',
+    'right',
+    'rlike',
+    'schema',
+    'schemas',
+    'second_microsecond',
+    'select',
+    'sensitive',
+    'separator',
+    'set',
+    'show',
+    'signal',
+    'smallint',
+    'spatial',
+    'specific',
+    'sql',
+    'sqlexception',
+    'sqlstate',
+    'sqlwarning',
+    'sql_big_result',
+    'sql_calc_found_rows',
+    'sql_small_result',
+    'ssl',
+    'starting',
+    'straight_join',
+    'table',
+    'terminated',
+    'then',
+    'tinyblob',
+    'tinyint',
+    'tinytext',
+    'to',
+    'trailing',
+    'trigger',
+    'true',
+    'undo',
+    'union',
+    'unique',
+    'unlock',
+    'unsigned',
+    'update',
+    'usage',
+    'use',
+    'using',
+    'utc_date',
+    'utc_time',
+    'utc_timestamp',
+    'values',
+    'varbinary',
+    'varchar',
+    'varcharacter',
+    'varying',
+    'when',
+    'where',
+    'while',
+    'with',
+    'write',
+    'xor',
+    'year_month',
+    'zerofill',
+  );
+}

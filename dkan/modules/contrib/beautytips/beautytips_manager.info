@@ -1,0 +1,10 @@
+name = BeautyTips Manager
+description = Adds graphical manager for creating custom beautytips.
+package = User interface
+dependencies[] = beautytips
+core = 7.x
+
+; Information added by drush on 2018-11-18
+version = "7.x-2.2+1-dev"
+project = "beautytips"
+datestamp = "1542553895"
